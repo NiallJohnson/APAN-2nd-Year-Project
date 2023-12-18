@@ -1,0 +1,161 @@
+---
+title: "Project"
+author: "Niall Johnson"
+date: "2023-11-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse) 
+```
+
+
+```{r}
+#https://fred.stlouisfed.org/tags/series?t=population%3Bstate
+##Import data
+state_pop <- read.table("State_Populations_Annual.txt", sep='\t', header = TRUE)
+
+state_pop_formatted <- state_pop %>%
+    pivot_longer(cols=AKPOP:WYPOP, names_to='State') %>%
+    mutate(State = substr(State, 1, 2), Census_year = floor((as.integer(substr(DATE, 1, 4)) - 1) / 10) * 10, Estimated_Population = value * 1000, election_year = (as.integer(substr(DATE, start=1, stop=4)) - 1788) %% 4 == 0) %>%
+    filter(DATE >= "1910-01-01") %>%
+    select(-value) 
+
+# add state electors that were added to the union
+new_electors <- read.csv("Late Entries.csv") %>%
+    mutate(added_electors = Electors, DATE = paste(as.character(Year), "-01-01", sep='')) %>%
+    select(-Electors, -Full.Name)
+
+state_pop_formatted <- state_pop_formatted %>%
+    left_join(new_electors, by = c('DATE' = 'DATE', "State" = "State"))
+
+head(state_pop_formatted)
+
+```
+
+```{r}
+#https://www.census.gov/data/tables/time-series/dec/apportionment-data-text.html
+
+# Takes into account states that were added to the union and had an election before the census year
+##import data
+census_pop <- read.csv("apportionment.csv")
+
+census_pop_formatted <- census_pop %>%
+    mutate(Electors = ifelse(Name == "District of Columbia", 3, Number.of.Representatives + 2)) %>%
+    select(-Geography.Type)
+
+head(census_pop_formatted)
+```
+
+```{r}
+#Create state join dataset
+state_data <- data.frame(
+  Abbreviation = c("AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", 
+                   "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", 
+                   "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"),
+  FullName = c("Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", "Connecticut", "Delaware", "District of Columbia",
+               "Florida", "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky", "Louisiana", "Maine",
+               "Maryland", "Massachusetts", "Michigan", "Minnesota", "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada",
+               "New Hampshire", "New Jersey", "New Mexico", "New York", "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon",
+               "Pennsylvania", "Rhode Island", "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah", "Vermont", "Virginia",
+               "Washington", "West Virginia", "Wisconsin", "Wyoming")
+)
+head(state_data)
+```
+```{r}
+#Join the data together
+df <- state_pop_formatted %>%
+        left_join(state_data, by = c('State' = 'Abbreviation')) %>%
+        left_join(census_pop_formatted, by = c("FullName" = "Name", "Census_year" = "Year")) %>%
+        mutate(Electors = ifelse(is.na(added_electors), Electors, added_electors))
+
+df["census_pop_numeric"] <- as.integer(gsub(',', '', df$Resident.Population))
+df["electoral_power"] <-ifelse(!is.na(df$Estimated_Population) & !is.na(df$Electors), df$Estimated_Population / df$Electors, 0) / 10000
+df["pop_difference"] <- df$Estimated_Population - df$census_pop_numeric
+df["pop_deviation"] <- df$pop_difference / df$census_pop_numeric
+
+head(df)
+```
+DV: 
+```{r}
+#Add election results since 2000
+##import data
+election_results <- read.csv("2000-2020 Election Results.csv")
+
+df2 <- df %>%
+        mutate(Date_year = as.integer(substring(DATE, 1, 4))) %>%
+        left_join(election_results, by = c("FullName" = "State", "Date_year" = "Year"))
+head(df2)
+
+```
+
+```{r}
+#Calculate total pop and total electors
+total <- df2 %>%
+  group_by(DATE) %>%
+  summarise(total_pop = sum(ifelse(!is.na(Estimated_Population), Estimated_Population , 0)), total_electors = sum(ifelse(!is.na(Electors), Electors, 0)))
+
+df3 <- df2 %>%
+    left_join(total, by = c("DATE" = "DATE")) %>%
+    mutate(pop_percent = Estimated_Population / total_pop, elector_percent = Electors / total_electors)
+
+head(df3)
+```
+
+```{r}
+#Estimate Electoral College totals
+
+elector_estimates <- df3 %>%
+    select(DATE, State, Estimated_Population, total_pop) %>%
+    filter(DATE >= '2000-01-01')
+
+calculate_representatives <- function(estimated_population, total_population, total_electors) {
+  # Calculate the proportion of the state's population to the total population
+  proportion <- estimated_population / total_population
+  
+  # Calculate the number of representatives for the state
+  representatives <- round(proportion * total_electors)
+  
+  # Ensure that each state has at least one representative
+  representatives[representatives < 1] <- 1
+  
+  return(representatives)
+}
+
+elector_estimates['estimate_electors'] <- calculate_representatives(elector_estimates['Estimated_Population'], elector_estimates['total_pop'], 438) + 2
+
+df4 <- df3 %>%
+        left_join(elector_estimates, by = c("State" = "State", "DATE" = "DATE"))
+
+head(df4)
+
+write.csv(df4, file = "combined_data.csv")
+```
+```{r}
+estimated_pop <- read.csv('Estimated Population.csv')
+
+electors <- df4 %>%
+    filter(DATE > "2021-01-01") %>%
+    select(State, Electors)
+
+df5 <- estimated_pop %>%
+    left_join(electors, by = c('State' = 'State'))
+
+total <- estimated_pop %>%
+  group_by(Year.of.Date) %>% 
+  mutate(total_pop = sum(Fed.Estimated.Pop)) %>%
+  select(Year.of.Date, total_pop)
+
+df5 <- df5 %>%
+  left_join(total, by = c('Year.of.Date'='Year.of.Date'))
+
+df5['estimate_electors'] <- calculate_representatives(df5$Fed.Estimated.Pop, df5$total_pop, 438) + 2
+    
+head(df5)
+
+write.csv(df5, file = "estimated_pop_data.csv")
+```
